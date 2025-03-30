@@ -266,6 +266,12 @@ func (s *Session) RequestWithLockedBucket(method, urlStr, contentType string, b 
 	case http.StatusOK:
 	case http.StatusCreated:
 	case http.StatusNoContent:
+	case http.StatusInternalServerError:
+		fallthrough
+	case http.StatusServiceUnavailable:
+		fallthrough
+	case http.StatusGatewayTimeout:
+		fallthrough
 	case http.StatusBadGateway:
 		// Retry sending request if possible
 		if sequence < cfg.MaxRestRetries {
@@ -275,7 +281,7 @@ func (s *Session) RequestWithLockedBucket(method, urlStr, contentType string, b 
 		} else {
 			err = fmt.Errorf("Exceeded Max retries HTTP %s, %s", resp.Status, response)
 		}
-	case 429: // TOO MANY REQUESTS - Rate limiting
+	case http.StatusTooManyRequests:
 		rl := TooManyRequests{}
 		err = Unmarshal(response, &rl)
 		if err != nil {
@@ -358,7 +364,7 @@ func (s *Session) UserAvatarDecode(u *User, options ...RequestOption) (img image
 }
 
 // UserUpdate updates current user settings.
-func (s *Session) UserUpdate(username, avatar string, options ...RequestOption) (st *User, err error) {
+func (s *Session) UserUpdate(username, avatar, banner string, options ...RequestOption) (st *User, err error) {
 
 	// NOTE: Avatar must be either the hash/id of existing Avatar or
 	// data:image/png;base64,BASE64_STRING_OF_NEW_AVATAR_PNG
@@ -368,7 +374,8 @@ func (s *Session) UserUpdate(username, avatar string, options ...RequestOption) 
 	data := struct {
 		Username string `json:"username,omitempty"`
 		Avatar   string `json:"avatar,omitempty"`
-	}{username, avatar}
+		Banner   string `json:"banner,omitempty"`
+	}{username, avatar, banner}
 
 	body, err := s.RequestWithBucketID("PATCH", EndpointUser("@me"), data, EndpointUsers, options...)
 	if err != nil {
@@ -1450,6 +1457,76 @@ func (s *Session) GuildEmojiEdit(guildID, emojiID string, data *EmojiParams, opt
 func (s *Session) GuildEmojiDelete(guildID, emojiID string, options ...RequestOption) (err error) {
 
 	_, err = s.RequestWithBucketID("DELETE", EndpointGuildEmoji(guildID, emojiID), nil, EndpointGuildEmojis(guildID), options...)
+	return
+}
+
+// ApplicationEmojis returns all emojis for the given application
+// appID : ID of the application
+func (s *Session) ApplicationEmojis(appID string, options ...RequestOption) (emojis []*Emoji, err error) {
+	body, err := s.RequestWithBucketID("GET", EndpointApplicationEmojis(appID), nil, EndpointApplicationEmojis(appID), options...)
+	if err != nil {
+		return
+	}
+
+	var temp struct {
+		Items []*Emoji `json:"items"`
+	}
+
+	err = unmarshal(body, &temp)
+	if err != nil {
+		return
+	}
+
+	emojis = temp.Items
+	return
+}
+
+// ApplicationEmoji returns the emoji for the given application.
+// appID   : ID of the application
+// emojiID : ID of an Emoji to retrieve
+func (s *Session) ApplicationEmoji(appID, emojiID string, options ...RequestOption) (emoji *Emoji, err error) {
+	var body []byte
+	body, err = s.RequestWithBucketID("GET", EndpointApplicationEmoji(appID, emojiID), nil, EndpointApplicationEmoji(appID, emojiID), options...)
+	if err != nil {
+		return
+	}
+
+	err = unmarshal(body, &emoji)
+	return
+}
+
+// ApplicationEmojiCreate creates a new Emoji for the given application.
+// appID : ID of the application
+// data  : New Emoji data
+func (s *Session) ApplicationEmojiCreate(appID string, data *EmojiParams, options ...RequestOption) (emoji *Emoji, err error) {
+	body, err := s.RequestWithBucketID("POST", EndpointApplicationEmojis(appID), data, EndpointApplicationEmojis(appID), options...)
+	if err != nil {
+		return
+	}
+
+	err = unmarshal(body, &emoji)
+	return
+}
+
+// ApplicationEmojiEdit modifies and returns updated Emoji for the given application.
+// appID   : ID of the application
+// emojiID : ID of an Emoji
+// data    : Updated Emoji data
+func (s *Session) ApplicationEmojiEdit(appID string, emojiID string, data *EmojiParams, options ...RequestOption) (emoji *Emoji, err error) {
+	body, err := s.RequestWithBucketID("PATCH", EndpointApplicationEmoji(appID, emojiID), data, EndpointApplicationEmojis(appID), options...)
+	if err != nil {
+		return
+	}
+
+	err = unmarshal(body, &emoji)
+	return
+}
+
+// ApplicationEmojiDelete deletes an Emoji for the given application.
+// appID   : ID of the application
+// emojiID : ID of an Emoji
+func (s *Session) ApplicationEmojiDelete(appID, emojiID string, options ...RequestOption) (err error) {
+	_, err = s.RequestWithBucketID("DELETE", EndpointApplicationEmoji(appID, emojiID), nil, EndpointApplicationEmojis(appID), options...)
 	return
 }
 
@@ -3451,5 +3528,51 @@ func (s *Session) UserApplicationRoleConnectionUpdate(appID string, rconn *Appli
 	}
 
 	err = unmarshal(body, &st)
+	return
+}
+
+// ----------------------------------------------------------------------
+// Functions specific to polls
+// ----------------------------------------------------------------------
+
+// PollAnswerVoters returns users who voted for a particular answer in a poll on the specified message.
+// channelID : ID of the channel.
+// messageID : ID of the message.
+// answerID  : ID of the answer.
+func (s *Session) PollAnswerVoters(channelID, messageID string, answerID int) (voters []*User, err error) {
+	endpoint := EndpointPollAnswerVoters(channelID, messageID, answerID)
+
+	var body []byte
+	body, err = s.RequestWithBucketID("GET", endpoint, nil, endpoint)
+	if err != nil {
+		return
+	}
+
+	var r struct {
+		Users []*User `json:"users"`
+	}
+
+	err = unmarshal(body, &r)
+	if err != nil {
+		return
+	}
+
+	voters = r.Users
+	return
+}
+
+// PollExpire expires poll on the specified message.
+// channelID : ID of the channel.
+// messageID : ID of the message.
+func (s *Session) PollExpire(channelID, messageID string) (msg *Message, err error) {
+	endpoint := EndpointPollExpire(channelID, messageID)
+
+	var body []byte
+	body, err = s.RequestWithBucketID("POST", endpoint, nil, endpoint)
+	if err != nil {
+		return
+	}
+
+	err = unmarshal(body, &msg)
 	return
 }

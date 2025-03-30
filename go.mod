@@ -149,5 +149,6 @@ require (
 )
 
 //replace github.com/matrix-org/gomatrix => github.com/matterbridge/gomatrix v0.0.0-20220205235239-607eb9ee6419
+replace github.com/bwmarrin/discordgo v0.28.1 => github.com/patrickxia/discordgo v0.28.2-0.20241123184033-075537beeed5
 
 go 1.22.0
