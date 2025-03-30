@@ -43,12 +43,13 @@ func (b *Bdiscord) maybeGetLocalAvatar(msg *config.Message) string {
 	return ""
 }
 
-func (b *Bdiscord) webhookSendTextOnly(msg *config.Message, channelID string) (string, error) {
+func (b *Bdiscord) webhookSendTextOnly(msg *config.Message, channelID string, threadID string) (string, error) {
 	msgParts := helper.ClipOrSplitMessage(msg.Text, MessageLength, b.GetString("MessageClipped"), b.GetInt("MessageSplitMaxCount"))
 	msgIds := []string{}
 	for _, msgPart := range msgParts {
 		res, err := b.transmitter.Send(
 			channelID,
+			threadID,
 			&discordgo.WebhookParams{
 				Content:         msgPart,
 				Username:        msg.Username,
@@ -66,40 +67,58 @@ func (b *Bdiscord) webhookSendTextOnly(msg *config.Message, channelID string) (s
 	return strings.Join(msgIds, ";"), nil
 }
 
-func (b *Bdiscord) webhookSendFilesOnly(msg *config.Message, channelID string) error {
-	for _, f := range msg.Extra["file"] {
+func (b *Bdiscord) webhookSendFilesOnly(msg *config.Message, channelID string, threadID string) (string, error) {
+	var (
+		messageId string = ""
+		err       error
+		content   string
+	)
+
+	files := []*discordgo.File{}
+
+	for i, f := range msg.Extra["file"] {
+
 		fi := f.(config.FileInfo) //nolint:forcetypeassert
+		if i == 0 {
+			content = fi.Comment
+		}
 		file := discordgo.File{
 			Name:        fi.Name,
 			ContentType: "",
 			Reader:      bytes.NewReader(*fi.Data),
 		}
-		content := fi.Comment
 
-		// Cannot use the resulting ID for any edits anyway, so throw it away.
-		// This has to be re-enabled when we implement message deletion.
-		_, err := b.transmitter.Send(
+		files = append(files, &file)
+	}
+
+	if len(files) > 0 {
+		res, err := b.transmitter.Send(
 			channelID,
+			threadID,
 			&discordgo.WebhookParams{
 				Username:        msg.Username,
 				AvatarURL:       msg.Avatar,
-				Files:           []*discordgo.File{&file},
+				Files:           files,
 				Content:         content,
 				AllowedMentions: b.getAllowedMentions(),
 			},
 		)
 		if err != nil {
-			b.Log.Errorf("Could not send file %#v for message %#v: %s", file, msg, err)
-			return err
+			b.Log.Errorf("Could not send file %#v for message %#v: %s", files, msg, err)
+			return "", err
+		}
+		if res != nil {
+			messageId = res.ID
 		}
 	}
-	return nil
+
+	return messageId, err
 }
 
 // webhookSend send one or more message via webhook, taking care of file
 // uploads (from slack, telegram or mattermost).
 // Returns messageID and error.
-func (b *Bdiscord) webhookSend(msg *config.Message, channelID string) (string, error) {
+func (b *Bdiscord) webhookSend(msg *config.Message, channelID string, threadID string) (string, error) {
 	var (
 		res string
 		err error
@@ -114,17 +133,15 @@ func (b *Bdiscord) webhookSend(msg *config.Message, channelID string) (string, e
 
 	// We can't send empty messages.
 	if msg.Text != "" {
-		res, err = b.webhookSendTextOnly(msg, channelID)
-	}
-
-	if err == nil && msg.Extra != nil {
-		err = b.webhookSendFilesOnly(msg, channelID)
+		res, err = b.webhookSendTextOnly(msg, channelID, threadID)
+	} else if msg.Extra != nil {
+		res, err = b.webhookSendFilesOnly(msg, channelID, threadID)
 	}
 
 	return res, err
 }
 
-func (b *Bdiscord) handleEventWebhook(msg *config.Message, channelID string) (string, error) {
+func (b *Bdiscord) handleEventWebhook(msg *config.Message, channelID string, threadID string) (string, error) {
 	// skip events
 	if msg.Event != "" && msg.Event != config.EventUserAction && msg.Event != config.EventJoinLeave && msg.Event != config.EventTopicChange {
 		return "", nil
@@ -153,7 +170,7 @@ func (b *Bdiscord) handleEventWebhook(msg *config.Message, channelID string) (st
 		for i := range msgParts {
 			// In case of split-messages where some parts remain the same (i.e. only a typo-fix in a huge message), this causes some noop-updates.
 			// TODO: Optimize away noop-updates of un-edited messages
-			editErr = b.transmitter.Edit(channelID, msgIds[i], &discordgo.WebhookParams{
+			editErr = b.transmitter.Edit(channelID, threadID, msgIds[i], &discordgo.WebhookParams{
 				Content:         msgParts[i],
 				Username:        msg.Username,
 				AllowedMentions: b.getAllowedMentions(),
@@ -170,7 +187,7 @@ func (b *Bdiscord) handleEventWebhook(msg *config.Message, channelID string) (st
 
 	b.Log.Debugf("Processing webhook sending for message %#v", msg)
 	msg.Text = b.replaceUserMentions(msg.Text)
-	msgID, err := b.webhookSend(msg, channelID)
+	msgID, err := b.webhookSend(msg, channelID, threadID)
 	if err != nil {
 		b.Log.Errorf("Could not broadcast via webhook for message %#v: %s", msgID, err)
 		return "", err

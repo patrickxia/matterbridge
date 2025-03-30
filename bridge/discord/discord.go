@@ -3,8 +3,10 @@ package bdiscord
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/42wim/matterbridge/bridge"
 	"github.com/42wim/matterbridge/bridge/config"
@@ -17,6 +19,10 @@ import (
 const (
 	MessageLength = 1950
 	cFileUpload   = "file_upload"
+)
+
+var (
+	emojiRE = regexp.MustCompile(`:(\w+):`)
 )
 
 type Bdiscord struct {
@@ -235,6 +241,10 @@ func (b *Bdiscord) Connect() error {
 		b.c.AddHandler(b.messageEvent)
 	}
 
+	tz, _ := time.LoadLocation("Europe/Prague")
+	now := time.Now().In(tz)
+	b.c.UpdateCustomStatus("Last restarted: " + now.Format(time.ANSIC))
+
 	return nil
 }
 
@@ -276,17 +286,43 @@ func (b *Bdiscord) Send(msg config.Message) (string, error) {
 		msg.ParentID = ""
 	}
 
-	// Use webhook to send the message
-	useWebhooks := b.shouldMessageUseWebhooks(&msg)
-	if useWebhooks && msg.Event != config.EventMsgDelete && msg.ParentID == "" {
-		return b.handleEventWebhook(&msg, channelID)
+	//Handle custom emoji
+	msg.Text = b.translateEmotes(msg.Text)
+
+	threadID := ""
+	if msg.ParentValid() {
+		if parentMessage, _ := b.c.ChannelMessage(channelID, msg.ParentID); parentMessage != nil {
+			if parentMessage.Thread != nil {
+				b.Log.Infof("Thread found: %s", parentMessage.Thread.ParentID)
+				threadID = parentMessage.Thread.ID
+			} else {
+				content := replaceEmotes(parentMessage.Content)
+				if content == "" {
+					content = "thread"
+				}
+				if len(content) > 100 {
+					content = content[:100]
+				}
+
+				b.Log.Infof("Creating thread")
+				var thread, err = b.c.MessageThreadStart(channelID, parentMessage.ID, content, 60)
+				b.Log.Infof("Created thread %s %s", thread.ID, err)
+				threadID = thread.ID
+			}
+		}
 	}
 
-	return b.handleEventBotUser(&msg, channelID)
+	// Use webhook to send the message
+	useWebhooks := b.shouldMessageUseWebhooks(&msg)
+	if useWebhooks && msg.Event != config.EventMsgDelete {
+		return b.handleEventWebhook(&msg, channelID, threadID)
+	}
+
+	return b.handleEventBotUser(&msg, channelID, threadID)
 }
 
 // handleEventDirect handles events via the bot user
-func (b *Bdiscord) handleEventBotUser(msg *config.Message, channelID string) (string, error) {
+func (b *Bdiscord) handleEventBotUser(msg *config.Message, channelID string, threadID string) (string, error) {
 	b.Log.Debugf("Broadcasting using token (API)")
 
 	// Delete message
@@ -294,7 +330,19 @@ func (b *Bdiscord) handleEventBotUser(msg *config.Message, channelID string) (st
 		if msg.ID == "" {
 			return "", nil
 		}
-		err := b.c.ChannelMessageDelete(channelID, msg.ID)
+
+		channel := channelID
+		if threadID != "" {
+			channel = threadID
+		}
+
+		err := b.c.ChannelMessageDelete(channel, msg.ID)
+		if threadID != "" {
+			if thread, err := b.c.Channel(threadID); err == nil && thread.MessageCount == 0 {
+				b.c.ChannelDelete(threadID)
+			}
+		}
+
 		return "", err
 	}
 
@@ -357,14 +405,6 @@ func (b *Bdiscord) handleEventBotUser(msg *config.Message, channelID string) (st
 			AllowedMentions: b.getAllowedMentions(),
 		}
 
-		if msg.ParentValid() {
-			m.Reference = &discordgo.MessageReference{
-				MessageID: msg.ParentID,
-				ChannelID: channelID,
-				GuildID:   b.guildID,
-			}
-		}
-
 		// Post normal message
 		res, err := b.c.ChannelMessageSendComplex(channelID, &m)
 		if err != nil {
@@ -402,4 +442,53 @@ func (b *Bdiscord) handleUploadFile(msg *config.Message, channelID string) (stri
 	}
 
 	return "", nil
+}
+
+// translate discord emoji
+func (b *Bdiscord) translateEmotes(text string) string {
+	if matchesRE := emojiRE.FindAllStringSubmatch(text, -1); len(matchesRE) > 0 {
+		matches := []string{}
+		dedupeMap := make(map[string]struct{})
+
+		for _, match := range matchesRE {
+			emojiName := match[1]
+
+			if _, exists := dedupeMap[emojiName]; !exists {
+				dedupeMap[emojiName] = struct{}{}
+				matches = append(matches, emojiName)
+			}
+		}
+
+		if emojis, err := b.c.GuildEmojis(b.guildID); err == nil {
+			for _, match := range matches {
+				if emoji := findEmoji(emojis, match); emoji != nil {
+					var emojiName = ":" + emoji.Name + ":"
+					var emojiString strings.Builder
+
+					emojiString.WriteString("<")
+					if emoji.Animated {
+						emojiString.WriteString("a")
+					}
+
+					emojiString.WriteString(emojiName)
+					emojiString.WriteString(emoji.ID)
+					emojiString.WriteString(">")
+
+					text = strings.ReplaceAll(text, emojiName, emojiString.String())
+				}
+			}
+		}
+	}
+
+	return text
+}
+
+func findEmoji(emojis []*discordgo.Emoji, emojiName string) *discordgo.Emoji {
+	for _, emoji := range emojis {
+		if emoji.Name == emojiName {
+			return emoji
+		}
+	}
+
+	return nil
 }
